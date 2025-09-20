@@ -18,6 +18,10 @@
 #   https://pytorch.org/tutorials/intermediate/reinforcement_q_learning.html                                   #
 ################################################################################################################
 
+# run PAI with CUDA_VISIBLE_DEVICES=0 PAIPASSWORD=123 python dqn_perforatedai.py -v -g breakout
+
+
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
@@ -28,6 +32,12 @@ import random, numpy, argparse, logging, os
 
 from collections import namedtuple
 from minatar import Environment
+from perforatedai import globals_perforatedai as GPA
+from perforatedai import utils_perforatedai as UPA
+
+# Final size of P mode
+# GPU Objects Count History: [500224, 500224]
+
 
 ################################################################################################################
 # Constants
@@ -37,7 +47,8 @@ BATCH_SIZE = 32
 REPLAY_BUFFER_SIZE = 100000
 TARGET_NETWORK_UPDATE_FREQ = 1000
 TRAINING_FREQ = 1
-NUM_FRAMES = 5000000
+NUM_FRAMES = 500000000000
+# NUM_FRAMES = 1000
 FIRST_N_FRAMES = 100000
 REPLAY_START_SIZE = 5000
 END_EPSILON = 0.1
@@ -48,6 +59,35 @@ GAMMA = 0.99
 EPSILON = 1.0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+import gc
+
+# Arrays to store history of GPU stats
+gpu_objects_count = []
+
+
+def count_objects_on_gpu():
+    # Force garbage collection to update counts
+    gc.collect()
+
+    # Count number of Python objects on GPU (tensors on cuda device)
+    count = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                count += 1
+        except:
+            pass
+
+    # Append to arrays
+    gpu_objects_count.append(count)
+
+    # Print arrays
+    if len(gpu_objects_count) < 3:
+        print("GPU Objects Count History:", gpu_objects_count)
+        return
+    del gpu_objects_count[0]
+    print("GPU Objects Count History:", gpu_objects_count)
 
 
 ################################################################################################################
@@ -184,7 +224,11 @@ def world_dynamics(t, replay_start_size, num_actions, s, env, policy_net):
             # view(1,1) shapes the tensor to be the right form (e.g. tensor([[0]])) without copying the
             # underlying tensor.  torch._no_grad() avoids tracking history in autograd.
             with torch.no_grad():
-                action = policy_net(s).max(1)[1].view(1, 1)
+                policy_net.eval()
+                action = (
+                    policy_net(s.detach().clone()).max(1)[1].view(1, 1).detach().clone()
+                )
+                policy_net.train()
 
     # Act according to the action and observe the transition and reward
     reward, terminated = env.act(action)
@@ -213,7 +257,7 @@ def world_dynamics(t, replay_start_size, num_actions, s, env, policy_net):
 #   optimizer: centered RMSProp
 #
 ################################################################################################################
-def train(sample, policy_net, target_net, optimizer):
+def train(sample, policy_net, target_net, optimizer, args=None):
     # Batch is a list of namedtuple's, the following operation returns samples grouped by keys
     batch_samples = transition(*zip(*sample))
 
@@ -290,6 +334,7 @@ def dqn(
     store_intermediate_result=False,
     load_path=None,
     step_size=STEP_SIZE,
+    args=None,
 ):
 
     # Get channels and number of actions specific to each game
@@ -302,17 +347,72 @@ def dqn(
     if not target_off:
         target_net = QNetwork(in_channels, num_actions).to(device)
         target_net.load_state_dict(policy_net.state_dict())
+    # Set up PAI global parameters
+    GPA.switch_mode = (
+        GPA.DOING_HISTORY
+    )  # When to switch between PAI and regular learning
+    # GPA.input_dimensions = [0, in_channels, 10, 10]  # PAI expects 0 for variable batch dimension
+    GPA.n_epochs_to_switch = 25  # Normal epochs before switching
+    GPA.p_epochs_to_switch = 25  # PAI epochs before switching
+    #    GPA.switch_mode = GPA.doing_fixed_switch
+    #    GPA.fixed_switch_num = 3
+    #    GPA.first_fixed_switch_num = 3
 
+    GPA.cap_at_n = True  # Makes sure subsequent rounds last max as long as first round
+    GPA.initial_history_after_switches = 5
+    GPA.test_saves = True
+    GPA.verbose = False
+    GPA.extra_verbose = False
+    GPA.debugging_input_dimensions = 1  # Enable debugging for input dimensions
+    GPA.debugging_memory_leak = False
+    GPA.testing_dendrite_capacity = False
+
+    import numpy as np
+
+    seed = 0
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    # When running on the CuDNN backend, two further options must be set
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # Set a fixed value for the hash seed
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # Ensure output directory exists for PAI graphs
+    # PAI creates subdirectories based on the save name
+    save_name = os.path.basename(output_file_name) if output_file_name else "pai_dqn"
+
+    # Create the directory in the current location where PAI will try to save
+    if not os.path.exists(save_name):
+        os.makedirs(save_name, exist_ok=True)
+
+    # Initialize the PAI for the policy network
+    logging.info("Initializing Perforated AI for policy network")
+    policy_net = UPA.initialize_pai(policy_net)  # PA
     if not replay_off:
         r_buffer = replay_buffer(REPLAY_BUFFER_SIZE)
         replay_start_size = REPLAY_START_SIZE
 
-    optimizer = optim.RMSprop(
-        policy_net.parameters(),
-        lr=step_size,
-        alpha=SQUARED_GRAD_MOMENTUM,
-        centered=True,
-        eps=MIN_SQUARED_GRAD,
+    # Setup the PAI-specific optimizer and scheduler
+    GPA.pai_tracker.set_optimizer(optim.RMSprop)
+    GPA.pai_tracker.set_scheduler(optim.lr_scheduler.ReduceLROnPlateau)
+
+    optimArgs = {
+        "params": policy_net.parameters(),
+        "lr": step_size,
+        "alpha": SQUARED_GRAD_MOMENTUM,
+        "centered": False,
+        "eps": MIN_SQUARED_GRAD,
+        # Note: No weight_decay as it can cause problems with PB learning
+    }
+    schedArgs = {
+        "mode": "max",
+        "patience": 5,  # Make sure this is lower than epochs to switch
+    }
+    optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(
+        policy_net, optimArgs, schedArgs
     )
 
     # Set initial values
@@ -345,7 +445,7 @@ def dqn(
         # Set to training mode
         policy_net.train()
         if not target_off:
-            target_net.train()
+            target_net.eval()
 
     # Data containers for performance measure and model related data
     data_return = data_return_init
@@ -370,41 +470,57 @@ def dqn(
             s_prime, action, reward, is_terminated = world_dynamics(
                 t, replay_start_size, num_actions, s, env, policy_net
             )
-
             sample = None
             if replay_off:
-                sample = [transition(s, s_prime, action, reward, is_terminated)]
+                sample = [
+                    transition(
+                        s.detach().clone(),
+                        s_prime.detach().clone(),
+                        action.detach().clone(),
+                        reward.detach().clone(),
+                        is_terminated.detach().clone(),
+                    )
+                ]
             else:
                 # Write the current frame to replay buffer
-                r_buffer.add(s, s_prime, action, reward, is_terminated)
-
+                detach = True
+                if detach:
+                    r_buffer.add(
+                        s.detach().clone(),
+                        s_prime.detach().clone(),
+                        action.detach().clone(),
+                        reward.detach().clone(),
+                        is_terminated.detach().clone(),
+                    )
+                else:
+                    r_buffer.add(s, s_prime, action, reward, is_terminated)
                 # Start learning when there's enough data and when we can sample a batch of size BATCH_SIZE
                 if t > REPLAY_START_SIZE and len(r_buffer.buffer) >= BATCH_SIZE:
                     # Sample a batch
                     sample = r_buffer.sample(BATCH_SIZE)
 
-            # Train every n number of frames defined by TRAINING_FREQ
             if t % TRAINING_FREQ == 0 and sample is not None:
                 if target_off:
-                    train(sample, policy_net, policy_net, optimizer)
+                    train(sample, policy_net, policy_net, optimizer, args)
                 else:
                     policy_net_update_counter += 1
-                    train(sample, policy_net, target_net, optimizer)
-
+                    train(sample, policy_net, target_net, optimizer, args)
             # Update the target network only after some number of policy network updates
             if (
                 not target_off
                 and policy_net_update_counter > 0
                 and policy_net_update_counter % TARGET_NETWORK_UPDATE_FREQ == 0
             ):
-                target_net.load_state_dict(policy_net.state_dict())
+                target_net = UPA.deep_copy_pai(policy_net)
+                # target_net.load_state_dict(policy_net.state_dict())
+                target_net.eval()
 
             G += reward.item()
 
             t += 1
 
             # Continue the process
-            s = s_prime
+            s = s_prime.detach().clone()
 
         # Increment the episodes
         e += 1
@@ -415,7 +531,7 @@ def dqn(
 
         # Logging exponentiated return only when verbose is turned on and only at 1000 episode intervals
         avg_return = 0.99 * avg_return + 0.01 * G
-        if e % 1000 == 0:
+        if e % 1000 == 0 and policy_net_update_counter > 0:
             logging.info(
                 "Episode "
                 + str(e)
@@ -428,6 +544,42 @@ def dqn(
                 + " | Time per frame: "
                 + str((time.time() - t_start) / t)
             )
+            count_objects_on_gpu()
+            policy_net, restructured, trainingComplete = (
+                GPA.pai_tracker.add_validation_score(avg_return, policy_net)
+            )
+
+            # Set up GPU settings (replace with whatever you're using for GPU setup)
+            policy_net = policy_net.to(device)
+            # If using DataParallel, uncomment the next line:
+            # policy_net = nn.DataParallel(policy_net)
+
+            # Check if training is complete according to PAI
+            if trainingComplete:
+                logging.info(
+                    "PAI determined training is complete at episode: " + str(e)
+                )
+                is_terminated = True
+                break  # Break the training loop
+            elif restructured:
+                logging.info("Model was restructured by Perforated AI")
+
+                # Reset optimizer with the same parameters used initially
+                optimArgs = {
+                    "params": policy_net.parameters(),
+                    "lr": step_size,
+                    "alpha": SQUARED_GRAD_MOMENTUM,
+                    "centered": False,
+                    "eps": MIN_SQUARED_GRAD,
+                    # Note: No weight_decay as it can cause problems with PB learning
+                }
+                schedArgs = {
+                    "mode": "max",
+                    "patience": 5,  # Make sure this is lower than epochs to switch
+                }
+                optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(
+                    policy_net, optimArgs, schedArgs
+                )
 
         # Save model data and other intermediate data if the corresponding flag is true
         if store_intermediate_result and e % 1000 == 0:
@@ -448,7 +600,6 @@ def dqn(
                 },
                 output_file_name + "_checkpoint",
             )
-
     # Print final logging info
     logging.info(
         "Avg return: "
@@ -505,6 +656,7 @@ def main():
         args.save,
         load_file_path,
         args.alpha,
+        args=args,
     )
 
 
